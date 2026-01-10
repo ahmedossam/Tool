@@ -1,0 +1,33 @@
+# VFX Automation Suite - Python Dependencies
+
+# Core GUI Framework
+
+
+# Image Processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+
+# PSD Support
+psd-tools>=1.9.0
+
+# Numerical Operations
+numpy>=1.24.0
+
+# Optional: Pose Detection (for advanced image segmentation)
+# mediapipe>=0.10.0
+
+# Optional: Advanced Image Processing
+# scikit-image>=0.21.0
+
+# Optional: 3D File Handling
+# trimesh>=3.23.0
+# pywavefront>=1.3.3
+
+# Optional: Video Metadata
+# ffmpeg-python>=0.2.0
+
+# Optional: Progress Bars
+# tqdm>=4.66.0
+
+# Optional: Notifications
+# requests>=2.31.0  # For webhooks
