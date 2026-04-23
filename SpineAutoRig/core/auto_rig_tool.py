@@ -1,4 +1,5 @@
 # auto_rig_tool.py
+# Standalone launcher — double-click or: python core/auto_rig_tool.py
 import sys
 import os
 import shutil
@@ -9,11 +10,21 @@ from PySide6 import QtWidgets, QtCore, QtGui
 from PIL import Image
 import numpy as np
 
-from psd_tools import PSDImage
+# Make sure the SpineAutoRig root is on sys.path so package imports work
+_CORE_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR = os.path.dirname(_CORE_DIR)
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
 
-from smart_layer_map import smart_remap_name
-from image_cut_tools import auto_cut_parts_from_image
-from rig_spine_export import SpineExporter
+try:
+    from psd_tools import PSDImage
+    PSDTOOLS_AVAILABLE = True
+except ImportError:
+    PSDTOOLS_AVAILABLE = False
+
+from core.smart_layer_map import smart_remap_name
+from utils.image_cut_tools import auto_cut_parts_from_image
+from core.rig_spine_export import SpineExporter
 
 EXPORT_ROOT = "EXPORT"
 
@@ -126,6 +137,11 @@ class AutoRigTool(QtWidgets.QWidget):
 
     # ---------- Import PSD ----------
     def on_import_psd(self):
+        if not PSDTOOLS_AVAILABLE:
+            QtWidgets.QMessageBox.warning(
+                self, "Missing dependency",
+                "psd-tools is not installed.\n\nRun:  pip install psd-tools")
+            return
         try:
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
                 self, "Select PSD file", "", "PSD Files (*.psd)")

@@ -353,8 +353,8 @@ class SpineRigCore:
         pose = mp_pose.Pose(static_image_mode=True,
                             min_detection_confidence=0.5)
 
-        # Detect pose
-        results = pose.detect(img_rgb)
+        # Detect pose  (MediaPipe API uses .process(), not .detect())
+        results = pose.process(img_rgb)
 
         if not results.pose_landmarks:
             self.log("⚠️ No pose detected - using fallback")

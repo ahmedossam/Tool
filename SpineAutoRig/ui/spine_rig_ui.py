@@ -1,797 +1,399 @@
 """
-Spine Auto-Rig Core Module
-Handles PSD/PNG processing, CV detection, and rigging logic
+SpineAutoRig - PySide6 GUI
+Main window for the Spine Auto-Rig tool.
 """
-
+import sys
 import os
-import json
-import hashlib
-import numpy as np
-from PIL import Image
-import cv2
+import shutil
+import traceback
+from datetime import datetime
 
-# Try import optional dependencies
+from PySide6 import QtWidgets, QtCore, QtGui
+from PIL import Image
+
+# Allow running standalone (python ui/spine_rig_ui.py) or as package
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from core.smart_layer_map import smart_remap_name
+from utils.image_cut_tools import auto_cut_parts_from_image
+from core.rig_spine_export import SpineExporter
+
 try:
     from psd_tools import PSDImage
     PSDTOOLS_AVAILABLE = True
 except ImportError:
     PSDTOOLS_AVAILABLE = False
 
-try:
-    import mediapipe as mp  # type: ignore
-    MEDIAPIPE_AVAILABLE = True
-except ImportError:
-    MEDIAPIPE_AVAILABLE = False
-
-# Alternative: OpenPose-like detection with OpenCV DNN
-try:
-    import cv2
-    OPENCV_AVAILABLE = True
-    # Try to check if DNN module is available
-    try:
-        cv2.dnn.readNetFromCaffe
-        OPENCV_DNN_AVAILABLE = True
-    except:
-        OPENCV_DNN_AVAILABLE = False
-except ImportError:
-    OPENCV_AVAILABLE = False
-    OPENCV_DNN_AVAILABLE = False
+EXPORT_ROOT = "EXPORT"
 
 
-###############################################################################
-# SMART NAME MAPPING - Maps common layer names to Spine bone names
-###############################################################################
-SMART_MAP = {
-    "head": ["head", "face", "cabeza", "tete"],
-    "neck": ["neck", "cuello", "cou"],
-    "torso": ["torso", "body", "chest", "belly", "spine", "waist", "trunk", "cuerpo"],
-    "hip": ["hip", "pelvis", "hips", "root", "cadera"],
-
-    # Left arm
-    "shoulder_L": ["left shoulder", "shoulder l", "l shoulder", "hombro izq"],
-    "upper_arm_L": ["left arm", "arm l", "l arm", "left upper arm", "upper arm l", "brazo izq"],
-    "forearm_L": ["left forearm", "l forearm", "forearm l", "lower arm l", "left lower arm"],
-    "hand_L": ["left hand", "hand l", "l hand", "mano izq"],
-
-    # Right arm
-    "shoulder_R": ["right shoulder", "shoulder r", "r shoulder", "hombro der"],
-    "upper_arm_R": ["right arm", "arm r", "r arm", "right upper arm", "upper arm r", "brazo der"],
-    "forearm_R": ["right forearm", "r forearm", "forearm r", "lower arm r", "right lower arm"],
-    "hand_R": ["right hand", "hand r", "r hand", "mano der"],
-
-    # Left leg
-    "upper_leg_L": ["left leg", "leg l", "thigh l", "upper leg l", "left thigh", "pierna izq"],
-    "lower_leg_L": ["left shin", "shin l", "lower leg l", "left calf", "pantorrilla izq"],
-    "foot_L": ["left foot", "foot l", "l foot", "pie izq"],
-
-    # Right leg
-    "upper_leg_R": ["right leg", "leg r", "thigh r", "upper leg r", "right thigh", "pierna der"],
-    "lower_leg_R": ["right shin", "shin r", "lower leg r", "right calf", "pantorrilla der"],
-    "foot_R": ["right foot", "foot r", "r foot", "pie der"]
-}
-
-# Parent hierarchy for humanoid rig
-BONE_PARENTS = {
-    "root": None,
-    "hip": "root",
-    "torso": "hip",
-    "neck": "torso",
-    "head": "neck",
-
-    "shoulder_L": "torso",
-    "upper_arm_L": "shoulder_L",
-    "forearm_L": "upper_arm_L",
-    "hand_L": "forearm_L",
-
-    "shoulder_R": "torso",
-    "upper_arm_R": "shoulder_R",
-    "forearm_R": "upper_arm_R",
-    "hand_R": "forearm_R",
-
-    "upper_leg_L": "hip",
-    "lower_leg_L": "upper_leg_L",
-    "foot_L": "lower_leg_L",
-
-    "upper_leg_R": "hip",
-    "lower_leg_R": "upper_leg_R",
-    "foot_R": "lower_leg_R"
-}
+def ts():
+    return datetime.now().strftime("%H:%M:%S")
 
 
-###############################################################################
-# CORE CLASS
-###############################################################################
-class SpineRigCore:
-    def __init__(self, log_callback=None):
-        self.log_callback = log_callback
-        self.layers = []
-        self.doc_width = 0
-        self.doc_height = 0
-        self.detected_pose = None
+class AutoRigTool(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Spine Auto-Rig  |  PSD + PNG + Folder")
+        self.resize(1050, 740)
 
-    def log(self, message):
-        """Send log message to callback"""
-        if self.log_callback:
-            self.log_callback(message)
+        self.loaded_layers = []   # {name, width, height, x, y, image, source_path}
+        self.doc_size = (1024, 1024)
+        self.current_file = None
+        self.export_root = os.path.abspath(EXPORT_ROOT)
 
-    ###########################################################################
-    # SMART NAME MAPPING
-    ###########################################################################
-    def smart_remap_name(self, name, enable_smart=True):
-        """Map layer name to standard bone name"""
-        if not enable_smart:
-            return name
+        self._build_ui()
+        self._check_deps()
+        self.log("Ready. Import a PSD (preferred), PNG, or a folder of images.")
 
-        n = name.lower().replace("_", " ").replace("-", " ").strip()
-
-        for target, synonyms in SMART_MAP.items():
-            for syn in synonyms:
-                if n == syn or syn in n:
-                    return target
-
-        return name
-
-    ###########################################################################
-    # PSD IMPORT
-    ###########################################################################
-    def import_psd(self, psd_path, smart_mapping=True, include_hidden=False,
-                   merge_groups=False, group_prefix=True):
-        """
-        Import PSD file and extract layers with positions
-
-        Args:
-            psd_path: Path to PSD file
-            smart_mapping: Enable smart name mapping
-            include_hidden: Include hidden layers
-            merge_groups: Merge group contents into single image
-            group_prefix: Add group name as prefix to layer names
-        """
+    # ------------------------------------------------------------------
+    # Dependency check
+    # ------------------------------------------------------------------
+    def _check_deps(self):
         if not PSDTOOLS_AVAILABLE:
-            raise Exception(
-                "psd-tools not installed. Install with: pip install psd-tools")
+            self.log("⚠️  psd-tools not installed — PSD import disabled.")
+            self.btn_psd.setEnabled(False)
+            self.btn_psd.setToolTip("pip install psd-tools")
 
-        self.log(f"Opening PSD: {os.path.basename(psd_path)}")
-        psd = PSDImage.open(psd_path)
-        self.doc_width, self.doc_height = psd.size
-        self.log(f"Document size: {self.doc_width}x{self.doc_height}px")
+    # ------------------------------------------------------------------
+    # UI layout
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        main = QtWidgets.QHBoxLayout(self)
 
-        doc_cx = self.doc_width / 2
-        doc_cy = self.doc_height / 2
+        # ── LEFT PANEL ──────────────────────────────────────────────
+        left = QtWidgets.QVBoxLayout()
 
-        self.layers = []
-        self.groups_info = {}  # Track group information
+        # Import
+        g_import = QtWidgets.QGroupBox("Import")
+        gl = QtWidgets.QVBoxLayout(g_import)
+        self.btn_psd = QtWidgets.QPushButton("📄  Import PSD  (preferred)")
+        self.btn_png = QtWidgets.QPushButton("🖼️  Import PNG  (alpha auto-cut)")
+        self.btn_folder = QtWidgets.QPushButton("📁  Import Folder of images")
+        for b in (self.btn_psd, self.btn_png, self.btn_folder):
+            b.setMinimumHeight(32)
+            gl.addWidget(b)
+        left.addWidget(g_import)
 
-        def extract_layer(layer, depth=0, parent_group=""):
-            # Skip hidden layers unless requested
-            if not include_hidden and not layer.visible:
-                return
+        # Options
+        g_opts = QtWidgets.QGroupBox("Options")
+        ol = QtWidgets.QVBoxLayout(g_opts)
+        self.chk_smart = QtWidgets.QCheckBox("Smart rename & auto bone mapping")
+        self.chk_smart.setChecked(True)
+        self.chk_ik = QtWidgets.QCheckBox("Generate IK constraints (arms & legs)")
+        self.chk_ik.setChecked(True)
+        ol.addWidget(self.chk_smart)
+        ol.addWidget(self.chk_ik)
+        left.addWidget(g_opts)
 
-            # Skip layers with names starting with _
-            if layer.name and layer.name.startswith('_'):
-                return
+        # Export
+        g_export = QtWidgets.QGroupBox("Export")
+        il = QtWidgets.QFormLayout(g_export)
+        self.txt_name = QtWidgets.QLineEdit("character")
+        self.btn_out = QtWidgets.QPushButton("Choose folder…")
+        self.lbl_out = QtWidgets.QLabel(self.export_root)
+        self.lbl_out.setWordWrap(True)
+        il.addRow("Character name:", self.txt_name)
+        il.addRow("Output root:", self.lbl_out)
+        il.addRow("", self.btn_out)
+        left.addWidget(g_export)
 
-            if hasattr(layer, 'is_group') and layer.is_group():
-                group_name = layer.name if layer.name else f"Group_{depth}"
-                self.log(f"{'  ' * depth}📁 Group: {group_name}")
+        self.btn_export = QtWidgets.QPushButton("⚡  Export Spine Project")
+        self.btn_export.setEnabled(False)
+        self.btn_export.setMinimumHeight(40)
+        self.btn_export.setStyleSheet("font-weight: bold;")
+        left.addWidget(self.btn_export)
+        left.addStretch()
+        main.addLayout(left, 1)
 
-                # Store group info
-                self.groups_info[group_name] = {
-                    "depth": depth,
-                    "visible": layer.visible,
-                    "parent": parent_group
-                }
+        # ── RIGHT PANEL ─────────────────────────────────────────────
+        right_v = QtWidgets.QVBoxLayout()
 
-                if merge_groups:
-                    # Merge all layers in group into single image
-                    self.merge_group_layers(layer, group_name, doc_cx, doc_cy,
-                                            depth, parent_group, smart_mapping)
-                else:
-                    # Process each layer in group separately
-                    new_parent = f"{parent_group}/{group_name}" if parent_group else group_name
-                    for sublayer in layer:
-                        extract_layer(sublayer, depth + 1, new_parent)
-            else:
-                if not layer.name:
+        # Layer list
+        g_parts = QtWidgets.QGroupBox("Detected layers  (click to preview)")
+        pv = QtWidgets.QVBoxLayout(g_parts)
+        self.list_parts = QtWidgets.QListWidget()
+        self.list_parts.setSelectionMode(
+            QtWidgets.QAbstractItemView.MultiSelection)
+        pv.addWidget(self.list_parts)
+        right_v.addWidget(g_parts, 3)
+
+        # Preview
+        g_preview = QtWidgets.QGroupBox("Preview")
+        pvl = QtWidgets.QVBoxLayout(g_preview)
+        self.lbl_preview = QtWidgets.QLabel("No preview")
+        self.lbl_preview.setFixedSize(360, 280)
+        self.lbl_preview.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_preview.setStyleSheet(
+            "background:#222; color:#888; border:1px solid #444;")
+        pvl.addWidget(self.lbl_preview)
+        right_v.addWidget(g_preview, 2)
+
+        # Log
+        g_log = QtWidgets.QGroupBox("Console")
+        lgl = QtWidgets.QVBoxLayout(g_log)
+        self.log_text = QtWidgets.QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setStyleSheet(
+            "font-family: monospace; font-size: 11px;")
+        lgl.addWidget(self.log_text)
+        right_v.addWidget(g_log, 2)
+
+        main.addLayout(right_v, 2)
+
+        # ── Signals ─────────────────────────────────────────────────
+        self.btn_psd.clicked.connect(self.on_import_psd)
+        self.btn_png.clicked.connect(self.on_import_png)
+        self.btn_folder.clicked.connect(self.on_import_folder)
+        self.btn_out.clicked.connect(self.on_choose_output)
+        self.btn_export.clicked.connect(self.on_export)
+        self.list_parts.itemSelectionChanged.connect(self.on_select_part)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def log(self, msg):
+        line = f"[{ts()}] {msg}"
+        self.log_text.append(line)
+        print(line)
+
+    def _reset(self):
+        self.loaded_layers = []
+        self.list_parts.clear()
+        self.lbl_preview.setText("No preview")
+        self.btn_export.setEnabled(False)
+
+    def _pil_to_qimage(self, pil):
+        data = pil.tobytes("raw", "RGBA")
+        return QtGui.QImage(data, pil.width, pil.height,
+                            QtGui.QImage.Format_RGBA8888)
+
+    # ------------------------------------------------------------------
+    # Import handlers
+    # ------------------------------------------------------------------
+    def on_import_psd(self):
+        if not PSDTOOLS_AVAILABLE:
+            QtWidgets.QMessageBox.warning(
+                self, "Missing dependency",
+                "psd-tools is not installed.\n\nRun:\n  pip install psd-tools")
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select PSD file", "", "PSD Files (*.psd)")
+        if not path:
+            return
+        self._reset()
+        self.current_file = path
+        try:
+            psd = PSDImage.open(path)
+            self.doc_size = psd.size
+            self.log(f"Opened PSD: {os.path.basename(path)}  size={self.doc_size}")
+
+            def traverse(layer):
+                if layer.is_group():
+                    for child in layer:
+                        traverse(child)
                     return
-
-                try:
-                    # Get bounding box
-                    bbox = layer.bbox
-                    if isinstance(bbox, tuple):
-                        x1, y1, x2, y2 = bbox
-                    else:
-                        x1, y1 = bbox.x1, bbox.y1
-                        x2, y2 = bbox.x2, bbox.y2
-
-                    w = max(x2 - x1, 1)
-                    h = max(y2 - y1, 1)
-
-                    # Calculate center position
+                if not getattr(layer, "visible", True):
+                    return
+                name_raw = layer.name or "layer"
+                name = smart_remap_name(name_raw) if self.chk_smart.isChecked() else name_raw
+                bbox = getattr(layer, "bbox", None)
+                if bbox and isinstance(bbox, tuple) and len(bbox) == 4:
+                    x1, y1, x2, y2 = bbox
+                    w = max(1, x2 - x1)
+                    h = max(1, y2 - y1)
                     cx = x1 + w / 2
                     cy = y1 + h / 2
+                    spine_x = cx - self.doc_size[0] / 2
+                    spine_y = self.doc_size[1] / 2 - cy
+                else:
+                    w = getattr(layer, "width", 100)
+                    h = getattr(layer, "height", 100)
+                    spine_x = spine_y = 0.0
+                try:
+                    pil = layer.composite().convert("RGBA")
+                except Exception:
+                    pil = None
+                self.loaded_layers.append({
+                    "name": name, "width": int(w), "height": int(h),
+                    "x": float(spine_x), "y": float(spine_y),
+                    "image": pil, "source_path": path
+                })
+                self.list_parts.addItem(name)
 
-                    # Convert to Spine coordinates (centered, Y-flipped)
-                    spine_x = cx - doc_cx
-                    spine_y = doc_cy - cy
+            for top in psd:
+                traverse(top)
 
-                    # Build layer name with group prefix if enabled
-                    layer_name = layer.name
-                    if group_prefix and parent_group:
-                        # Use only the immediate parent group name
-                        immediate_parent = parent_group.split('/')[-1]
-                        layer_name = f"{immediate_parent}_{layer_name}"
+            self.log(f"✅ Imported {len(self.loaded_layers)} layers from PSD.")
+            if self.loaded_layers:
+                self.btn_export.setEnabled(True)
+        except Exception as e:
+            self.log(f"❌ PSD import failed: {e}")
+            self.log(traceback.format_exc())
 
-                    # Smart remap name
-                    mapped_name = self.smart_remap_name(
-                        layer_name, smart_mapping)
-
-                    # Try to get image data
-                    try:
-                        img = layer.topil()
-                    except:
-                        img = None
-
-                    self.layers.append({
-                        "name": mapped_name,
-                        "original_name": layer.name,
-                        "full_name": layer_name,
-                        "group_path": parent_group,
-                        "width": int(w),
-                        "height": int(h),
-                        "x": round(spine_x, 2),
-                        "y": round(spine_y, 2),
-                        "image_data": img
-                    })
-
-                    prefix = f"{parent_group}/" if parent_group else ""
-                    self.log(
-                        f"{'  ' * depth}✓ {prefix}{layer.name} → {mapped_name} @ ({spine_x:.1f}, {spine_y:.1f})")
-
-                except Exception as e:
-                    self.log(
-                        f"{'  ' * depth}⚠️ Could not parse {layer.name}: {str(e)}")
-
-        extract_layer(psd)
-
-        if self.groups_info:
-            self.log(f"\n📁 Found {len(self.groups_info)} groups:")
-            for group_name, info in self.groups_info.items():
-                self.log(f"  • {group_name} (depth: {info['depth']})")
-
-        self.log(f"\n✅ Extracted {len(self.layers)} layers")
-        return self.layers
-
-    def merge_group_layers(self, group, group_name, doc_cx, doc_cy, depth,
-                           parent_group, smart_mapping):
-        """Merge all layers in a group into a single composite image"""
+    def on_import_png(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select PNG", "", "PNG Files (*.png)")
+        if not path:
+            return
+        self._reset()
+        self.current_file = path
         try:
-            # Get group bounding box
-            bbox = group.bbox
-            if isinstance(bbox, tuple):
-                x1, y1, x2, y2 = bbox
-            else:
-                x1, y1 = bbox.x1, bbox.y1
-                x2, y2 = bbox.x2, bbox.y2
+            parts = auto_cut_parts_from_image(path, min_area=200)
+            if not parts:
+                self.log("⚠️  No parts detected — image may have no alpha channel.")
+                return
+            maxw = max(p['x'] + p['w'] for p in parts)
+            maxh = max(p['y'] + p['h'] for p in parts)
+            self.doc_size = (max(maxw + 200, 1024), max(maxh + 200, 1024))
 
-            w = max(x2 - x1, 1)
-            h = max(y2 - y1, 1)
+            for i, p in enumerate(parts):
+                name = p.get("name", f"part_{i}")
+                name = smart_remap_name(name) if self.chk_smart.isChecked() else name
+                arr = p['image']
+                pil = Image.fromarray(arr[..., [2, 1, 0, 3]])   # BGRA → RGBA
+                cx = p['x'] + p['w'] / 2
+                cy = p['y'] + p['h'] / 2
+                spine_x = cx - self.doc_size[0] / 2
+                spine_y = self.doc_size[1] / 2 - cy
+                self.loaded_layers.append({
+                    "name": name, "width": int(p['w']), "height": int(p['h']),
+                    "x": float(spine_x), "y": float(spine_y),
+                    "image": pil, "source_path": path
+                })
+                self.list_parts.addItem(name)
 
-            # Calculate center position
-            cx = x1 + w / 2
-            cy = y1 + h / 2
-            spine_x = cx - doc_cx
-            spine_y = doc_cy - cy
+            self.log(f"✅ Auto-cut: {len(parts)} parts extracted from PNG.")
+            if self.loaded_layers:
+                self.btn_export.setEnabled(True)
+        except Exception as e:
+            self.log(f"❌ PNG import failed: {e}")
+            self.log(traceback.format_exc())
 
-            # Try to composite the group
+    def on_import_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select folder containing images")
+        if not folder:
+            return
+        self._reset()
+        self.current_file = folder
+        self.doc_size = (1024, 1024)
+        files = sorted(f for f in os.listdir(folder)
+                       if f.lower().endswith(('.png', '.jpg', '.jpeg')))
+        for f in files:
+            p = os.path.join(folder, f)
             try:
-                img = group.composite()
-            except:
-                self.log(
-                    f"{'  ' * depth}⚠️ Could not composite group {group_name}")
+                pil = Image.open(p).convert("RGBA")
+                name = os.path.splitext(f)[0]
+                name = smart_remap_name(name) if self.chk_smart.isChecked() else name
+                self.loaded_layers.append({
+                    "name": name, "width": pil.width, "height": pil.height,
+                    "x": 0.0, "y": 0.0, "image": pil, "source_path": p
+                })
+                self.list_parts.addItem(name)
+            except Exception as e:
+                self.log(f"⚠️  Could not load {f}: {e}")
+        self.log(f"✅ Loaded {len(self.loaded_layers)} images from folder.")
+        if self.loaded_layers:
+            self.btn_export.setEnabled(True)
+
+    def on_choose_output(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Choose export root folder")
+        if d:
+            self.export_root = os.path.abspath(d)
+            self.lbl_out.setText(self.export_root)
+
+    # ------------------------------------------------------------------
+    # Preview
+    # ------------------------------------------------------------------
+    def on_select_part(self):
+        items = self.list_parts.selectedItems()
+        if not items:
+            self.lbl_preview.setText("No preview")
+            return
+        name = items[0].text()
+        for L in self.loaded_layers:
+            if L['name'] == name:
+                img = L.get('image')
+                if img is None:
+                    self.lbl_preview.setText("No image data")
+                    return
+                qimg = self._pil_to_qimage(img)
+                pix = QtGui.QPixmap.fromImage(qimg).scaled(
+                    self.lbl_preview.size(),
+                    QtCore.Qt.KeepAspectRatio,
+                    QtCore.Qt.SmoothTransformation)
+                self.lbl_preview.setPixmap(pix)
                 return
 
-            # Smart remap name
-            mapped_name = self.smart_remap_name(group_name, smart_mapping)
-
-            self.layers.append({
-                "name": mapped_name,
-                "original_name": group_name,
-                "full_name": group_name,
-                "group_path": parent_group,
-                "width": int(w),
-                "height": int(h),
-                "x": round(spine_x, 2),
-                "y": round(spine_y, 2),
-                "image_data": img,
-                "is_merged_group": True
-            })
-
-            self.log(
-                f"{'  ' * depth}✓ Merged group '{group_name}' → {mapped_name}")
-
-        except Exception as e:
-            self.log(
-                f"{'  ' * depth}⚠️ Could not merge group {group_name}: {str(e)}")
-
-    ###########################################################################
-    # PNG IMPORT WITH CV DETECTION
-    ###########################################################################
-    def import_png_with_detection(self, png_path, auto_segment=True):
-        """Import PNG and use CV to detect body parts"""
-        self.log(f"Opening PNG: {os.path.basename(png_path)}")
-
-        img = Image.open(png_path).convert("RGBA")
-        self.doc_width, self.doc_height = img.size
-        self.log(f"Image size: {self.doc_width}x{self.doc_height}px")
-
-        if auto_segment and MEDIAPIPE_AVAILABLE:
-            self.log("Running pose detection...")
-            self.layers = self.detect_and_segment_body_parts(img)
-        else:
-            # Fallback: treat whole image as single part
-            self.log("No segmentation - using full image")
-            self.layers = [{
-                "name": "body",
-                "original_name": "body",
-                "width": self.doc_width,
-                "height": self.doc_height,
-                "x": 0,
-                "y": 0,
-                "image_data": img
-            }]
-
-        return self.layers
-
-    def detect_and_segment_body_parts(self, pil_image):
-        """Use MediaPipe to detect pose and segment body parts"""
-        # Convert PIL to OpenCV format
-        img_array = np.array(pil_image)
-        img_rgb = cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB)
-
-        # Initialize MediaPipe Pose
-        mp_pose = mp.solutions.pose
-        pose = mp_pose.Pose(static_image_mode=True,
-                            min_detection_confidence=0.5)
-
-        # Detect pose
-        results = pose.detect(img_rgb)
-
-        if not results.pose_landmarks:
-            self.log("⚠️ No pose detected - using fallback")
-            return self.fallback_segmentation(pil_image)
-
-        self.log("✓ Pose detected! Extracting body parts...")
-        self.detected_pose = results.pose_landmarks
-
-        # Get landmarks
-        landmarks = results.pose_landmarks.landmark
-        h, w = img_rgb.shape[:2]
-
-        doc_cx = w / 2
-        doc_cy = h / 2
-
-        # Define body part regions using landmarks
-        parts = self.define_body_regions(landmarks, w, h)
-
-        # Extract each part
-        extracted_layers = []
-
-        for part_name, (x1, y1, x2, y2) in parts.items():
-            # Ensure bounds are valid
-            x1 = max(0, int(x1))
-            y1 = max(0, int(y1))
-            x2 = min(w, int(x2))
-            y2 = min(h, int(y2))
-
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            # Crop region
-            part_img = pil_image.crop((x1, y1, x2, y2))
-
-            # Calculate center in Spine coordinates
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
-            spine_x = cx - doc_cx
-            spine_y = doc_cy - cy
-
-            extracted_layers.append({
-                "name": part_name,
-                "original_name": part_name,
-                "width": x2 - x1,
-                "height": y2 - y1,
-                "x": round(spine_x, 2),
-                "y": round(spine_y, 2),
-                "image_data": part_img
-            })
-
-            self.log(f"  ✓ Extracted: {part_name}")
-
-        pose.close()
-        return extracted_layers
-
-    def define_body_regions(self, landmarks, width, height):
-        """Define bounding boxes for each body part from pose landmarks"""
-        mp_pose = mp.solutions.pose.PoseLandmark
-
-        def get_point(idx):
-            lm = landmarks[idx]
-            return lm.x * width, lm.y * height
-
-        def expand_bbox(points, margin=0.1):
-            """Create bbox from points with margin"""
-            xs = [p[0] for p in points]
-            ys = [p[1] for p in points]
-            x1, x2 = min(xs), max(xs)
-            y1, y2 = min(ys), max(ys)
-
-            w = x2 - x1
-            h = y2 - y1
-
-            return (
-                x1 - w * margin,
-                y1 - h * margin,
-                x2 + w * margin,
-                y2 + h * margin
-            )
-
-        regions = {}
-
-        # Head
-        nose = get_point(mp_pose.NOSE)
-        l_ear = get_point(mp_pose.LEFT_EAR)
-        r_ear = get_point(mp_pose.RIGHT_EAR)
-        regions["head"] = expand_bbox([nose, l_ear, r_ear], 0.3)
-
-        # Torso
-        l_shoulder = get_point(mp_pose.LEFT_SHOULDER)
-        r_shoulder = get_point(mp_pose.RIGHT_SHOULDER)
-        l_hip = get_point(mp_pose.LEFT_HIP)
-        r_hip = get_point(mp_pose.RIGHT_HIP)
-        regions["torso"] = expand_bbox(
-            [l_shoulder, r_shoulder, l_hip, r_hip], 0.1)
-
-        # Left arm
-        l_elbow = get_point(mp_pose.LEFT_ELBOW)
-        l_wrist = get_point(mp_pose.LEFT_WRIST)
-        regions["upper_arm_L"] = expand_bbox([l_shoulder, l_elbow], 0.15)
-        regions["forearm_L"] = expand_bbox([l_elbow, l_wrist], 0.15)
-        regions["hand_L"] = expand_bbox(
-            [l_wrist, get_point(mp_pose.LEFT_PINKY), get_point(mp_pose.LEFT_INDEX)], 0.2)
-
-        # Right arm
-        r_elbow = get_point(mp_pose.RIGHT_ELBOW)
-        r_wrist = get_point(mp_pose.RIGHT_WRIST)
-        regions["upper_arm_R"] = expand_bbox([r_shoulder, r_elbow], 0.15)
-        regions["forearm_R"] = expand_bbox([r_elbow, r_wrist], 0.15)
-        regions["hand_R"] = expand_bbox(
-            [r_wrist, get_point(mp_pose.RIGHT_PINKY), get_point(mp_pose.RIGHT_INDEX)], 0.2)
-
-        # Left leg
-        l_knee = get_point(mp_pose.LEFT_KNEE)
-        l_ankle = get_point(mp_pose.LEFT_ANKLE)
-        regions["upper_leg_L"] = expand_bbox([l_hip, l_knee], 0.15)
-        regions["lower_leg_L"] = expand_bbox([l_knee, l_ankle], 0.15)
-        regions["foot_L"] = expand_bbox([l_ankle, get_point(
-            mp_pose.LEFT_HEEL), get_point(mp_pose.LEFT_FOOT_INDEX)], 0.2)
-
-        # Right leg
-        r_knee = get_point(mp_pose.RIGHT_KNEE)
-        r_ankle = get_point(mp_pose.RIGHT_ANKLE)
-        regions["upper_leg_R"] = expand_bbox([r_hip, r_knee], 0.15)
-        regions["lower_leg_R"] = expand_bbox([r_knee, r_ankle], 0.15)
-        regions["foot_R"] = expand_bbox([r_ankle, get_point(
-            mp_pose.RIGHT_HEEL), get_point(mp_pose.RIGHT_FOOT_INDEX)], 0.2)
-
-        return regions
-
-    def fallback_segmentation(self, pil_image):
-        """Simple color-based segmentation fallback"""
-        self.log("Using fallback color-based segmentation...")
-        # Simple implementation: treat whole image as one part
-        return [{
-            "name": "body",
-            "original_name": "body",
-            "width": pil_image.width,
-            "height": pil_image.height,
-            "x": 0,
-            "y": 0,
-            "image_data": pil_image
-        }]
-
-    ###########################################################################
-    # FOLDER IMPORT
-    ###########################################################################
-    def import_folder(self, folder_path, smart_mapping=True):
-        """Import PNG images from folder"""
-        self.log(f"Scanning folder: {folder_path}")
-
-        self.layers = []
-        image_files = [f for f in os.listdir(folder_path)
-                       if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-
-        for img_file in sorted(image_files):
-            img_path = os.path.join(folder_path, img_file)
-            img = Image.open(img_path).convert("RGBA")
-
-            name = os.path.splitext(img_file)[0]
-            mapped_name = self.smart_remap_name(name, smart_mapping)
-
-            self.layers.append({
-                "name": mapped_name,
-                "original_name": name,
-                "width": img.width,
-                "height": img.height,
-                "x": 0,
-                "y": 0,
-                "image_data": img
-            })
-
-            self.log(f"  ✓ {img_file} → {mapped_name}")
-
-        self.log(f"Imported {len(self.layers)} images")
-        return self.layers
-
-    ###########################################################################
-    # BONE GENERATION
-    ###########################################################################
-    def generate_bones(self, use_hierarchy=True):
-        """Generate bone structure from layers"""
-        bones = [{"name": "root", "x": 0, "y": 0}]
-
-        for layer in self.layers:
-            bone = {
-                "name": layer["name"],
-                "x": layer["x"],
-                "y": layer["y"]
-            }
-
-            # Determine parent
-            if use_hierarchy and layer["name"] in BONE_PARENTS:
-                parent = BONE_PARENTS[layer["name"]]
-                if parent:
-                    bone["parent"] = parent
-                else:
-                    bone["parent"] = "root"
-            else:
-                bone["parent"] = "root"
-
-            # Calculate length (distance from parent position)
-            if "parent" in bone and bone["parent"] != "root":
-                parent_layer = next(
-                    (l for l in self.layers if l["name"] == bone["parent"]), None)
-                if parent_layer:
-                    dx = layer["x"] - parent_layer["x"]
-                    dy = layer["y"] - parent_layer["y"]
-                    length = int(np.sqrt(dx**2 + dy**2))
-                    bone["length"] = max(length, 10)
-
-            bones.append(bone)
-
-        return bones
-
-    def generate_slots(self):
-        """Generate slots for attachments"""
-        return [
-            {
-                "name": layer["name"],
-                "bone": layer["name"],
-                "attachment": layer["original_name"]
-            }
-            for layer in self.layers
-        ]
-
-    def generate_attachments(self):
-        """Generate attachment definitions"""
-        attachments = {}
-
-        for layer in self.layers:
-            attachments[layer["name"]] = {
-                layer["original_name"]: {
-                    "type": "region",
-                    "name": layer["original_name"],
-                    "x": 0,
-                    "y": 0,
-                    "rotation": 0,
-                    "width": layer["width"],
-                    "height": layer["height"]
-                }
-            }
-
-        return attachments
-
-    def generate_ik_constraints(self, create_ik=True):
-        """Generate IK constraints for arms and legs"""
-        if not create_ik:
-            return []
-
-        ik_list = []
-
-        # Check which bones exist
-        bone_names = [l["name"] for l in self.layers]
-
-        # Left arm IK
-        if all(b in bone_names for b in ["upper_arm_L", "forearm_L", "hand_L"]):
-            ik_list.append({
-                "name": "arm_L_ik",
-                "order": len(ik_list),
-                "bones": ["upper_arm_L", "forearm_L"],
-                "target": "hand_L",
-                "bendPositive": False,
-                "mix": 1
-            })
-
-        # Right arm IK
-        if all(b in bone_names for b in ["upper_arm_R", "forearm_R", "hand_R"]):
-            ik_list.append({
-                "name": "arm_R_ik",
-                "order": len(ik_list),
-                "bones": ["upper_arm_R", "forearm_R"],
-                "target": "hand_R",
-                "bendPositive": True,
-                "mix": 1
-            })
-
-        # Left leg IK
-        if all(b in bone_names for b in ["upper_leg_L", "lower_leg_L", "foot_L"]):
-            ik_list.append({
-                "name": "leg_L_ik",
-                "order": len(ik_list),
-                "bones": ["upper_leg_L", "lower_leg_L"],
-                "target": "foot_L",
-                "bendPositive": True,
-                "mix": 1
-            })
-
-        # Right leg IK
-        if all(b in bone_names for b in ["upper_leg_R", "lower_leg_R", "foot_R"]):
-            ik_list.append({
-                "name": "leg_R_ik",
-                "order": len(ik_list),
-                "bones": ["upper_leg_R", "lower_leg_R"],
-                "target": "foot_R",
-                "bendPositive": True,
-                "mix": 1
-            })
-
-        return ik_list
-
-    ###########################################################################
-    # EXPORT
-    ###########################################################################
-    def export_spine_project(self, output_folder, character_name, create_ik=True, use_hierarchy=True):
-        """Export complete Spine project with JSON and images"""
-        if not self.layers:
-            raise Exception("No layers to export. Import a file first.")
-
-        # Create project structure
-        project_folder = os.path.join(output_folder, character_name)
-        images_folder = os.path.join(project_folder, "images")
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+    def on_export(self):
+        if not self.loaded_layers:
+            QtWidgets.QMessageBox.warning(
+                self, "No data", "Import a PSD, PNG, or image folder first.")
+            return
+        char = self.txt_name.text().strip() or "character"
+        dest = os.path.join(self.export_root, char)
+        images_folder = os.path.join(dest, "images")
         os.makedirs(images_folder, exist_ok=True)
 
-        self.log(f"Creating project: {project_folder}")
+        selected = [it.text() for it in self.list_parts.selectedItems()]
+        if not selected:
+            selected = [L['name'] for L in self.loaded_layers]
 
-        # Export images
-        for layer in self.layers:
-            if layer["image_data"]:
-                # Use original_name for file, but could use full_name if needed
-                img_filename = layer.get('full_name', layer['original_name'])
-                # Sanitize filename
-                img_filename = img_filename.replace(
-                    '/', '_').replace('\\', '_')
-                img_path = os.path.join(images_folder, f"{img_filename}.png")
-                layer["image_data"].save(img_path, "PNG")
-                self.log(f"  ✓ Saved: {img_filename}.png")
+        # Save images
+        exported = []
+        for L in self.loaded_layers:
+            if L['name'] not in selected:
+                continue
+            target = os.path.join(images_folder, f"{L['name']}.png")
+            try:
+                if isinstance(L.get('image'), Image.Image):
+                    L['image'].save(target, "PNG")
+                else:
+                    shutil.copy2(L['source_path'], target)
+                exported.append(L['name'])
+            except Exception as e:
+                self.log(f"⚠️  Could not save {L['name']}: {e}")
 
-        # Generate Spine JSON
-        spine_data = {
-            "skeleton": {
-                "hash": hashlib.md5(character_name.encode()).hexdigest()[:8],
-                "spine": "4.1",
-                "x": 0,
-                "y": 0,
-                "width": self.doc_width,
-                "height": self.doc_height,
-                "images": "./images/",
-                "audio": ""
-            },
-            "bones": self.generate_bones(use_hierarchy),
-            "slots": self.generate_slots(),
-            "skins": [
-                {
-                    "name": "default",
-                    "attachments": self.generate_attachments()
-                }
-            ],
-            "animations": {
-                "animation": {}
-            }
-        }
+        self.log(f"Saved {len(exported)} images → {images_folder}")
 
-        # Add IK constraints
-        ik = self.generate_ik_constraints(create_ik)
-        if ik:
-            spine_data["ik"] = ik
-            self.log(f"  ✓ Added {len(ik)} IK constraints")
-
-        # Save JSON
-        json_path = os.path.join(project_folder, f"{character_name}.json")
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(spine_data, f, indent=2, ensure_ascii=False)
-
-        self.log(f"  ✓ Saved: {character_name}.json")
-
-        # Create README
-        self.create_readme(project_folder, character_name, len(self.layers))
-
-        self.log(f"✅ Export complete! Project at: {project_folder}")
-        return project_folder
-
-    def create_readme(self, project_folder, char_name, layer_count):
-        """Create import instructions"""
-        group_info = ""
-        if hasattr(self, 'groups_info') and self.groups_info:
-            group_info = f"\n📁 PSD Groups: {len(self.groups_info)} groups were processed"
-            merged = sum(1 for l in self.layers if l.get('is_merged_group'))
-            if merged > 0:
-                group_info += f"\n   • {merged} groups were merged into single images"
-
-        readme = f"""
-╔══════════════════════════════════════════════════════════════╗
-║        SPINE IMPORT GUIDE - {char_name.upper()}
-╚══════════════════════════════════════════════════════════════╝
-
-✅ PROJECT READY FOR IMPORT
-
-📁 Location: {project_folder}
-
-📦 Contents:
-   • {char_name}.json          ← Skeleton data
-   • images/                    ← {layer_count} PNG files
-   • README.txt                 ← This file{group_info}
-
-═══════════════════════════════════════════════════════════════
-
-🎯 HOW TO IMPORT IN SPINE EDITOR:
-
-1. Open Spine Editor (4.x)
-
-2. Import Project:
-   → Spine Menu → Import Data (Ctrl+I)
-   → Select: "Folder"  ⚠️ IMPORTANT - NOT "JSON file"!
-   → Browse to: {project_folder}
-   → Click Import
-
-3. All images will load automatically!
-
-═══════════════════════════════════════════════════════════════
-
-💡 TIPS:
-
-• Press F to frame skeleton in view
-• Switch between Setup and Animate modes with Tab
-• Use IK handles for easy posing
-• Groups were {'merged' if any(l.get('is_merged_group') for l in self.layers) else 'expanded into individual bones'}
-
-═══════════════════════════════════════════════════════════════
-Generated by Spine Auto-Rig Tool
-"""
-
-        readme_path = os.path.join(project_folder, "README.txt")
-        with open(readme_path, 'w', encoding='utf-8') as f:
-            f.write(readme)
+        try:
+            exporter = SpineExporter(
+                layers=self.loaded_layers,
+                selected=selected,
+                doc_size=self.doc_size,
+                enable_ik=self.chk_ik.isChecked()
+            )
+            json_path = os.path.join(dest, f"{char}.json")
+            exporter.export(json_path)
+            self.log(f"✅ Spine project exported to: {dest}")
+            QtWidgets.QMessageBox.information(
+                self, "Done! 🎉",
+                f"Spine project exported to:\n{dest}\n\n"
+                f"Open Spine → Import Data (Ctrl+I) → select the folder above.")
+        except Exception as e:
+            self.log(f"❌ Export failed: {e}")
+            self.log(traceback.format_exc())
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(e))
 
 
-###############################################################################
-# UTILITY FUNCTIONS
-###############################################################################
-def check_dependencies():
-    """Check which optional dependencies are available"""
-    deps = {
-        "psd-tools": PSDTOOLS_AVAILABLE,
-        "mediapipe": MEDIAPIPE_AVAILABLE,
-        "opencv-python": True,  # Already imported
-        "pillow": True,  # Already imported
-        "numpy": True  # Already imported
-    }
-    return deps
+# ------------------------------------------------------------------
+# Entry point
+# ------------------------------------------------------------------
+def launch_ui():
+    """Launch the Spine Auto-Rig GUI."""
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    win = AutoRigTool()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    launch_ui()
